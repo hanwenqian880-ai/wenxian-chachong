@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import requests
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 from pypdf import PdfReader
@@ -10,6 +11,10 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 DB_FILE = "paper_database.json"
+
+# DeepSeek API配置（从环境变量读取）
+DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # ----------------------
 # 加载文献库
@@ -22,57 +27,108 @@ def load_papers():
         return []
 
 # ----------------------
-# 从上传的 PDF 提取标题
+# 保存文献库
 # ----------------------
-def extract_title_from_pdf(pdf_path):
+def save_papers(papers):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(papers, f, ensure_ascii=False, indent=2)
+
+# ----------------------
+# 用DeepSeek AI提取文献信息
+# ----------------------
+def extract_info_by_ai(text):
+    try:
+        prompt = f"""请从以下学术论文首页文本中提取信息，以JSON格式返回：
+{{
+    "title": "论文标题",
+    "author": "第一作者姓名",
+    "year": "发表年份"
+}}
+
+注意：
+1. 标题通常是最大字号、最显眼的文字，不是"Abstract"、"Introduction"等
+2. 作者名通常在标题下方，可能是英文名或中文名
+3. 年份可能在作者信息中，或从期刊信息推断
+
+文本内容：
+{text[:3000]}"""
+
+        response = requests.post(
+            DEEPSEEK_API_URL,
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1
+            },
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            json_match = re.search(r'\{[^}]+\}', content, re.DOTALL)
+            if json_match:
+                info = json.loads(json_match.group())
+                return info
+    except Exception as e:
+        print(f"AI提取失败: {e}")
+    return None
+
+# ----------------------
+# 从PDF提取首页文本
+# ----------------------
+def extract_text_from_pdf(pdf_path):
     try:
         reader = PdfReader(pdf_path)
-        info = reader.metadata
-        title = info.title if info and info.title else None
-
-        # 元数据没有就从第一页文本猜
-        if not title and len(reader.pages) > 0:
-            text = reader.pages[0].extract_text()[:3000].strip()
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
-            for line in lines[:15]:
-                if len(line) > 15 and not line.lower().startswith(('abstract', 'keywords', 'introduction', 'http', 'www', 'doi')):
-                    title = line
-                    break
-        return title or "无法识别标题"
-    except Exception as e:
-        return None
+        if len(reader.pages) > 0:
+            return reader.pages[0].extract_text()
+    except:
+        pass
+    return ""
 
 # ----------------------
-# 从PDF提取完整信息
+# 从PDF提取完整信息（使用AI）
 # ----------------------
 def extract_info_from_pdf(pdf_path, filename):
     try:
+        text = extract_text_from_pdf(pdf_path)
+        ai_info = extract_info_by_ai(text)
+
+        if ai_info:
+            if ai_info.get('year') == '未知' or not ai_info.get('year'):
+                year_match = re.search(r'(20\d{2})', filename)
+                ai_info['year'] = year_match.group(1) if year_match else "未知"
+
+            return {
+                "title": ai_info.get('title', '未知'),
+                "author": ai_info.get('author', '未知'),
+                "year": ai_info.get('year', '未知'),
+                "filename": filename
+            }
+
+        # AI失败，用传统方法
         reader = PdfReader(pdf_path)
         info = reader.metadata
-
         title = info.title if info and info.title else None
         author = info.author if info and info.author else None
 
-        # 从文件名提取年份
         year_match = re.search(r'(20\d{2})', filename)
         year = year_match.group(1) if year_match else "未知"
 
-        # 如果元数据没有标题，从第一页文本提取
         if not title and len(reader.pages) > 0:
-            text = reader.pages[0].extract_text()[:3000].strip()
             lines = [l.strip() for l in text.splitlines() if l.strip()]
             for line in lines[:15]:
                 if len(line) > 15 and not line.lower().startswith(('abstract', 'keywords', 'introduction', 'http', 'www', 'doi')):
                     title = line
                     break
 
-        # 如果没有作者，尝试从文件名提取
         if not author:
-            author_match = re.match(r'^[\d\s]*([A-Za-z\u4e00-\u9fff]+)', filename)
-            if author_match:
-                author = author_match.group(1)
-            else:
-                author = "未知"
+            author_match = re.match(r'^[\d\s]*([A-Za-z一-鿿]+)', filename)
+            author = author_match.group(1) if author_match else "未知"
 
         return {
             "title": title or filename.replace('.pdf', ''),
@@ -93,10 +149,8 @@ def is_duplicate(new_title, paper_list, threshold=65):
     for paper in paper_list:
         p_title = paper["title"]
         p_clean = re.sub(r'[^\w]', '', p_title.lower()).strip()
-        # 包含匹配
         if new_clean in p_clean or p_clean in new_clean:
             return True, paper
-        # 相似度匹配
         common = set(new_clean) & set(p_clean)
         rate = len(common) / max(len(new_clean), len(p_clean)) * 100
         if rate >= threshold:
@@ -277,6 +331,7 @@ body{
 .paper-list-header{
     display:flex;
     align-items:center;
+    justify-content:space-between;
     gap:10px;
     margin-bottom:20px
 }
@@ -284,6 +339,16 @@ body{
     color:#e91e63;
     margin:0;
     font-size:1.5em
+}
+.add-paper-btn{
+    padding:10px 20px;
+    background:linear-gradient(135deg,#00c853,#69f0ae);
+    color:white;
+    border:none;
+    border-radius:50px;
+    cursor:pointer;
+    font-weight:600;
+    font-size:0.9em
 }
 .search-input{
     width:100%;
@@ -305,7 +370,8 @@ body{
     margin:12px 0;
     border-radius:12px;
     border-left:4px solid #e91e63;
-    transition:transform 0.2s,box-shadow 0.2s
+    transition:transform 0.2s,box-shadow 0.2s;
+    position:relative
 }
 .paper-item:hover{
     transform:translateX(5px);
@@ -314,12 +380,43 @@ body{
 .paper-title{
     font-weight:700;
     color:#333;
-    font-size:1.05em
+    font-size:1.05em;
+    padding-right:80px
 }
 .paper-meta{
     color:#888;
     font-size:0.9em;
     margin-top:6px
+}
+.paper-actions{
+    position:absolute;
+    right:15px;
+    top:50%;
+    transform:translateY(-50%);
+    display:flex;
+    gap:8px
+}
+.edit-btn,.delete-btn{
+    padding:6px 12px;
+    border:none;
+    border-radius:20px;
+    cursor:pointer;
+    font-size:0.85em;
+    font-weight:600
+}
+.edit-btn{
+    background:#e3f2fd;
+    color:#1976d2
+}
+.edit-btn:hover{
+    background:#bbdefb
+}
+.delete-btn{
+    background:#ffebee;
+    color:#e53935
+}
+.delete-btn:hover{
+    background:#ffcdd2
 }
 .empty-msg{
     text-align:center;
@@ -330,6 +427,74 @@ body{
     text-align:center;
     padding:20px;
     color:#e91e63
+}
+/* 编辑弹窗 */
+.modal{
+    display:none;
+    position:fixed;
+    top:0;
+    left:0;
+    width:100%;
+    height:100%;
+    background:rgba(0,0,0,0.5);
+    z-index:1000;
+    justify-content:center;
+    align-items:center
+}
+.modal.show{
+    display:flex
+}
+.modal-content{
+    background:white;
+    padding:30px;
+    border-radius:20px;
+    width:90%;
+    max-width:500px;
+    box-shadow:0 20px 60px rgba(0,0,0,0.3)
+}
+.modal-title{
+    color:#e91e63;
+    margin:0 0 20px 0;
+    font-size:1.3em
+}
+.modal-input{
+    width:100%;
+    padding:12px 15px;
+    border:2px solid #fce4ec;
+    border-radius:10px;
+    font-size:1em;
+    margin-bottom:15px
+}
+.modal-input:focus{
+    outline:none;
+    border-color:#e91e63
+}
+.modal-label{
+    display:block;
+    margin-bottom:5px;
+    color:#666;
+    font-weight:600
+}
+.modal-btns{
+    display:flex;
+    gap:10px;
+    justify-content:flex-end;
+    margin-top:20px
+}
+.modal-btn{
+    padding:10px 25px;
+    border:none;
+    border-radius:50px;
+    cursor:pointer;
+    font-weight:600
+}
+.modal-cancel{
+    background:#f5f5f5;
+    color:#666
+}
+.modal-save{
+    background:linear-gradient(135deg,#e91e63,#f48fb1);
+    color:white
 }
 </style>
 </head>
@@ -355,9 +520,45 @@ body{
 <div class="paper-list-section">
     <div class="paper-list-header">
         <h2>📖 已分享文献汇总</h2>
+        <button class="add-paper-btn" onclick="showAddModal()">+ 手动添加</button>
     </div>
     <input type="text" id="searchInput" class="search-input" placeholder="搜索标题、作者或年份..." oninput="filterPapers()">
     <div id="paperList" class="loading">加载中...</div>
+</div>
+
+<!-- 编辑弹窗 -->
+<div id="editModal" class="modal">
+    <div class="modal-content">
+        <h3 class="modal-title">编辑文献信息</h3>
+        <label class="modal-label">标题</label>
+        <input type="text" id="editTitle" class="modal-input">
+        <label class="modal-label">作者</label>
+        <input type="text" id="editAuthor" class="modal-input">
+        <label class="modal-label">年份</label>
+        <input type="text" id="editYear" class="modal-input">
+        <input type="hidden" id="editIndex">
+        <div class="modal-btns">
+            <button class="modal-btn modal-cancel" onclick="closeModal()">取消</button>
+            <button class="modal-btn modal-save" onclick="saveEdit()">保存</button>
+        </div>
+    </div>
+</div>
+
+<!-- 添加弹窗 -->
+<div id="addModal" class="modal">
+    <div class="modal-content">
+        <h3 class="modal-title">手动添加文献</h3>
+        <label class="modal-label">标题</label>
+        <input type="text" id="addTitle" class="modal-input" placeholder="请输入论文标题">
+        <label class="modal-label">作者</label>
+        <input type="text" id="addAuthor" class="modal-input" placeholder="请输入作者">
+        <label class="modal-label">年份</label>
+        <input type="text" id="addYear" class="modal-input" placeholder="请输入年份">
+        <div class="modal-btns">
+            <button class="modal-btn modal-cancel" onclick="closeAddModal()">取消</button>
+            <button class="modal-btn modal-save" onclick="manualAdd()">添加</button>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -390,6 +591,10 @@ function renderPapers(papers){
             html += `<div class="paper-item">
                 <div class="paper-title">${i+1}. ${p.title}</div>
                 <div class="paper-meta">作者：${p.author} | 年份：${p.year}</div>
+                <div class="paper-actions">
+                    <button class="edit-btn" onclick="editPaper(${i})">编辑</button>
+                    <button class="delete-btn" onclick="deletePaper(${i})">删除</button>
+                </div>
             </div>`;
         });
     }
@@ -415,7 +620,7 @@ async function uploadAndCheck(){
     let dom = document.getElementById('result');
     dom.className = 'result-box';
     dom.style.display = 'block';
-    dom.innerHTML = '<div class="loading">正在查重中...</div>';
+    dom.innerHTML = '<div class="loading">正在用AI识别文献信息...</div>';
 
     let res = await fetch('/upload-check', {method:'POST', body:form});
     let data = await res.json();
@@ -426,7 +631,9 @@ async function uploadAndCheck(){
         dom.innerHTML = `
             <div class="result-title">❌ 这篇文献已经分享过啦</div>
             <div class="result-content">
-                <strong>识别标题：</strong>${data.title}
+                <strong>识别标题：</strong>${data.title}<br>
+                <strong>识别作者：</strong>${data.full_info?.author || '未知'}<br>
+                <strong>识别年份：</strong>${data.full_info?.year || '未知'}
                 <div class="paper-match">
                     <strong>已存在记录：</strong><br>
                     ${data.paper.title}<br>
@@ -438,7 +645,9 @@ async function uploadAndCheck(){
         dom.innerHTML = `
             <div class="result-title">✅ 这是一篇新文献，可以分享</div>
             <div class="result-content">
-                <strong>识别标题：</strong>${data.title}
+                <strong>识别标题：</strong>${data.title}<br>
+                <strong>识别作者：</strong>${data.full_info?.author || '未知'}<br>
+                <strong>识别年份：</strong>${data.full_info?.year || '未知'}
                 <br><br>
                 <button class="add-btn" onclick="addToDatabase()">添加到数据库</button>
             </div>`;
@@ -469,6 +678,102 @@ async function addToDatabase(){
     }
 }
 
+function editPaper(index){
+    let paper = allPapers[index];
+    document.getElementById('editTitle').value = paper.title;
+    document.getElementById('editAuthor').value = paper.author;
+    document.getElementById('editYear').value = paper.year;
+    document.getElementById('editIndex').value = index;
+    document.getElementById('editModal').classList.add('show');
+}
+
+function closeModal(){
+    document.getElementById('editModal').classList.remove('show');
+}
+
+async function saveEdit(){
+    let index = parseInt(document.getElementById('editIndex').value);
+    let updatedPaper = {
+        title: document.getElementById('editTitle').value,
+        author: document.getElementById('editAuthor').value,
+        year: document.getElementById('editYear').value,
+        filename: allPapers[index].filename || ''
+    };
+
+    let res = await fetch('/update-paper', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: index, paper: updatedPaper})
+    });
+    let data = await res.json();
+
+    if(data.success){
+        closeModal();
+        loadPapers();
+        loadCount();
+    } else {
+        alert('保存失败');
+    }
+}
+
+async function deletePaper(index){
+    if(!confirm('确定要删除这篇文献吗？')) return;
+
+    let res = await fetch('/delete-paper', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: index})
+    });
+    let data = await res.json();
+
+    if(data.success){
+        loadPapers();
+        loadCount();
+    } else {
+        alert('删除失败');
+    }
+}
+
+function showAddModal(){
+    document.getElementById('addTitle').value = '';
+    document.getElementById('addAuthor').value = '';
+    document.getElementById('addYear').value = '';
+    document.getElementById('addModal').classList.add('show');
+}
+
+function closeAddModal(){
+    document.getElementById('addModal').classList.remove('show');
+}
+
+async function manualAdd(){
+    let paper = {
+        title: document.getElementById('addTitle').value,
+        author: document.getElementById('addAuthor').value,
+        year: document.getElementById('addYear').value,
+        filename: ''
+    };
+
+    if(!paper.title){
+        alert('请输入标题');
+        return;
+    }
+
+    let res = await fetch('/add-paper', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(paper)
+    });
+    let data = await res.json();
+
+    if(data.success){
+        closeAddModal();
+        loadPapers();
+        loadCount();
+    } else {
+        alert('添加失败：' + (data.error || '未知错误'));
+    }
+}
+
 loadCount();
 loadPapers();
 </script>
@@ -491,7 +796,7 @@ def papers():
     return jsonify(load_papers())
 
 # ----------------------
-# 核心：上传PDF + 查重
+# 接口：上传PDF + 查重
 # ----------------------
 @app.route('/upload-check', methods=['POST'])
 def upload_check():
@@ -506,14 +811,13 @@ def upload_check():
     path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(path)
 
-    title = extract_title_from_pdf(path)
+    full_info = extract_info_from_pdf(path, filename)
+    title = full_info['title'] if full_info else "无法识别标题"
+
     papers = load_papers()
     dup, paper = is_duplicate(title, papers)
 
-    # 提取完整信息用于可能的添加
-    full_info = extract_info_from_pdf(path, filename)
-
-    os.remove(path)  # 上传后删除，不占空间
+    os.remove(path)
 
     return jsonify({
         "title": title,
@@ -523,7 +827,7 @@ def upload_check():
     })
 
 # ----------------------
-# 接口：添加文献到数据库
+# 接口：添加文献
 # ----------------------
 @app.route('/add-paper', methods=['POST'])
 def add_paper():
@@ -532,13 +836,10 @@ def add_paper():
         return jsonify({"error": "missing data"}), 400
 
     papers = load_papers()
-
-    # 检查是否已存在
     dup, _ = is_duplicate(data['title'], papers)
     if dup:
         return jsonify({"error": "already exists"}), 400
 
-    # 添加新文献
     new_paper = {
         "title": data.get('title', '未知'),
         "author": data.get('author', '未知'),
@@ -546,12 +847,50 @@ def add_paper():
         "filename": data.get('filename', '')
     }
     papers.append(new_paper)
-
-    # 保存到文件
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(papers, f, ensure_ascii=False, indent=2)
+    save_papers(papers)
 
     return jsonify({"success": True, "paper": new_paper})
+
+# ----------------------
+# 接口：更新文献
+# ----------------------
+@app.route('/update-paper', methods=['POST'])
+def update_paper():
+    data = request.json
+    index = data.get('index')
+    paper = data.get('paper')
+
+    if index is None or not paper:
+        return jsonify({"error": "missing data"}), 400
+
+    papers = load_papers()
+    if index < 0 or index >= len(papers):
+        return jsonify({"error": "invalid index"}), 400
+
+    papers[index] = paper
+    save_papers(papers)
+
+    return jsonify({"success": True})
+
+# ----------------------
+# 接口：删除文献
+# ----------------------
+@app.route('/delete-paper', methods=['POST'])
+def delete_paper():
+    data = request.json
+    index = data.get('index')
+
+    if index is None:
+        return jsonify({"error": "missing index"}), 400
+
+    papers = load_papers()
+    if index < 0 or index >= len(papers):
+        return jsonify({"error": "invalid index"}), 400
+
+    papers.pop(index)
+    save_papers(papers)
+
+    return jsonify({"success": True})
 
 if __name__ == '__main__':
     import os
