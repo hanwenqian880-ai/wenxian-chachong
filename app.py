@@ -554,6 +554,7 @@ def add_paper():
     return jsonify({"success": True, "paper": new_paper})
 
 if __name__ == '__main__':
+    import os
+    port = int(os.environ.get('PORT', 5000))
     print("文献查重系统已启动")
-    print("打开浏览器访问：http://127.0.0.1:5000")
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=port)
